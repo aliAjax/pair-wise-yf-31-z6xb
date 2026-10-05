@@ -6,6 +6,7 @@ import argparse
 import json
 import os
 import sqlite3
+import threading
 from contextlib import contextmanager
 from datetime import datetime, time, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -56,19 +57,22 @@ class Repository:
     def __init__(self, db_path: str | Path):
         self.conn = sqlite3.connect(str(db_path), check_same_thread=False, isolation_level=None)
         self.conn.row_factory = sqlite3.Row
+        self._write_lock = threading.RLock()
         self.conn.execute("PRAGMA foreign_keys=ON")
         self.conn.execute("PRAGMA journal_mode=WAL")
         self._init()
 
     @contextmanager
     def tx(self):
-        self.conn.execute("BEGIN IMMEDIATE")
-        try:
-            yield self.conn
-            self.conn.execute("COMMIT")
-        except Exception:
-            self.conn.execute("ROLLBACK")
-            raise
+        # Serializes writers on the shared connection so racing requests never interleave.
+        with self._write_lock:
+            self.conn.execute("BEGIN IMMEDIATE")
+            try:
+                yield self.conn
+                self.conn.execute("COMMIT")
+            except Exception:
+                self.conn.execute("ROLLBACK")
+                raise
 
     def _init(self) -> None:
         self.conn.executescript(
@@ -87,16 +91,36 @@ class Repository:
             CREATE TABLE IF NOT EXISTS recovery_plans(
                 id INTEGER PRIMARY KEY AUTOINCREMENT, disruption_id INTEGER NOT NULL REFERENCES disruptions(id), name TEXT NOT NULL,
                 status TEXT NOT NULL DEFAULT 'draft', revision INTEGER NOT NULL DEFAULT 1, score_json TEXT, metrics_json TEXT,
-                created_by TEXT NOT NULL, created_at TEXT NOT NULL, locked_at TEXT, locked_by TEXT
+                created_by TEXT NOT NULL, created_at TEXT NOT NULL, locked_at TEXT, locked_by TEXT,
+                parent_plan_id INTEGER, frozen_at TEXT
             );
             CREATE TABLE IF NOT EXISTS assignments(
                 id INTEGER PRIMARY KEY AUTOINCREMENT, plan_id INTEGER NOT NULL REFERENCES recovery_plans(id) ON DELETE CASCADE,
                 flight_id INTEGER NOT NULL REFERENCES flights(id), aircraft_id TEXT NOT NULL REFERENCES aircraft(id), crew_id TEXT NOT NULL REFERENCES crew(id),
                 new_std TEXT NOT NULL, new_sta TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'planned', delay_minutes INTEGER NOT NULL DEFAULT 0,
-                missed_connections INTEGER NOT NULL DEFAULT 0, UNIQUE(plan_id,flight_id)
+                missed_connections INTEGER NOT NULL DEFAULT 0, source_assignment_id INTEGER, affected_by_json TEXT,
+                UNIQUE(plan_id,flight_id)
             );
             CREATE TABLE IF NOT EXISTS audit_log(id INTEGER PRIMARY KEY AUTOINCREMENT, plan_id INTEGER, actor TEXT NOT NULL, role TEXT NOT NULL, action TEXT NOT NULL, detail_json TEXT NOT NULL, created_at TEXT NOT NULL);
             """
+        )
+        self._migrate()
+
+    def _migrate(self) -> None:
+        """Additively upgrade older databases so legacy locked plans keep working."""
+        additions = {
+            "recovery_plans": {"parent_plan_id": "INTEGER", "frozen_at": "TEXT"},
+            "assignments": {"source_assignment_id": "INTEGER", "affected_by_json": "TEXT"},
+        }
+        for table, columns in additions.items():
+            existing = {row["name"] for row in self.conn.execute(f"PRAGMA table_info({table})")}
+            for name, declaration in columns.items():
+                if name not in existing:
+                    self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {declaration}")
+        # A frozen/locked plan may only have one editable replacement draft.
+        self.conn.execute(
+            """CREATE UNIQUE INDEX IF NOT EXISTS idx_plan_draft_parent ON recovery_plans(parent_plan_id)
+               WHERE parent_plan_id IS NOT NULL AND status='draft'"""
         )
 
     @staticmethod
@@ -227,12 +251,21 @@ class AirlineRecoveryService:
         if not flight: raise ApiError(404, "flight_not_found", "航班不存在")
         if flight["status"] == "canceled" and item.get("status", "planned") != "canceled":
             raise ApiError(409, "canceled_flight", "已取消航班不能安排执行")
-        delay = int((std - parse_time(flight["std"])).total_seconds() // 60)
+        if replace:
+            # Editing a seeded replan adjustment compensates on top of the inherited baseline
+            # instead of resetting the cumulative delay against the already-replanned std.
+            previous = conn.execute("SELECT new_std, delay_minutes FROM assignments WHERE plan_id=? AND flight_id=?",
+                                    (plan_id, item["flight_id"])).fetchone()
+            if not previous:
+                raise ApiError(404, "assignment_not_found", "待替换的航班调整不存在")
+            delay = previous["delay_minutes"] + int((std - parse_time(previous["new_std"])).total_seconds() // 60)
+        else:
+            delay = int((std - parse_time(flight["std"])).total_seconds() // 60)
         missed = int(item.get("missed_connections", 0))
         if missed < 0: raise ApiError(400, "invalid_connections", "missed_connections 不能为负")
         try:
             if replace:
-                conn.execute("""UPDATE assignments SET aircraft_id=?,crew_id=?,new_std=?,new_sta=?,status=?,delay_minutes=?,missed_connections=?
+                conn.execute("""UPDATE assignments SET aircraft_id=?,crew_id=?,new_std=?,new_sta=?,status=?,delay_minutes=?,missed_connections=?,affected_by_json=NULL
                                 WHERE plan_id=? AND flight_id=?""",
                              (item["aircraft_id"], item["crew_id"], iso(std), iso(sta), item.get("status", "planned"), delay, missed, plan_id, item["flight_id"]))
                 if conn.execute("SELECT changes()").fetchone()[0] == 0:
@@ -256,9 +289,27 @@ class AirlineRecoveryService:
             if plan["status"] != "draft": raise ApiError(409, "plan_locked", "已锁定方案不能修改")
             if plan["revision"] != expected: raise ApiError(409, "revision_conflict", "方案已被其他人更新")
             self._insert_assignment(conn, plan_id, body, replace=True)
-            conn.execute("UPDATE recovery_plans SET revision=revision+1 WHERE id=?", (plan_id,))
+            conn.execute("UPDATE recovery_plans SET revision=revision+1,metrics_json=NULL,score_json=NULL WHERE id=?", (plan_id,))
             Repository.audit(conn, plan_id, actor, role, "assignment_reassigned", {"flight_id": body.get("flight_id")})
             return self.get_plan(plan_id)
+
+    def _disruption_hits(self, conn: sqlite3.Connection, aircraft_id: str, crew_id: str,
+                         origin: str, destination: str, std: datetime, sta: datetime) -> list[dict[str, Any]]:
+        """Return all active disruptions overlapping a flight window (resources or airport)."""
+        rows = conn.execute("SELECT * FROM disruptions WHERE status='active'").fetchall()
+        hits: list[dict[str, Any]] = []
+        for row in rows:
+            d_start, d_end = parse_time(row["starts_at"]), parse_time(row["ends_at"])
+            if not overlaps(std, sta, d_start, d_end):
+                continue
+            kind, resource = row["kind"], row["resource_id"]
+            if kind == "aircraft_fault" and resource == aircraft_id:
+                hits.append({"disruption_id": row["id"], "code": "aircraft_fault_active", "resource": resource})
+            elif kind == "crew_timeout" and resource == crew_id:
+                hits.append({"disruption_id": row["id"], "code": "crew_timeout_active", "resource": resource})
+            elif kind == "airport_closure" and resource in (origin, destination):
+                hits.append({"disruption_id": row["id"], "code": "airport_closed", "resource": resource})
+        return hits
 
     def _validate_plan(self, conn: sqlite3.Connection, plan_id: int) -> list[dict[str, Any]]:
         plan = conn.execute("SELECT * FROM recovery_plans WHERE id=?", (plan_id,)).fetchone()
@@ -276,6 +327,8 @@ class AirlineRecoveryService:
             crew = conn.execute("SELECT * FROM crew WHERE id=?", (row["crew_id"],)).fetchone()
             origin = conn.execute("SELECT * FROM airports WHERE code=?", (row["origin"],)).fetchone()
             destination = conn.execute("SELECT * FROM airports WHERE code=?", (row["destination"],)).fetchone()
+            for hit in self._disruption_hits(conn, row["aircraft_id"], row["crew_id"], row["origin"], row["destination"], std, sta):
+                problems.append({"assignment_id": row["id"], **hit})
             if not aircraft or aircraft["status"] != "active": problems.append({"assignment_id": row["id"], "code": "aircraft_unavailable"})
             elif parse_time(aircraft["maintenance_due"]) < sta: problems.append({"assignment_id": row["id"], "code": "maintenance_due", "resource": aircraft["id"]})
             if not crew or crew["status"] != "active": problems.append({"assignment_id": row["id"], "code": "crew_unavailable"})
@@ -323,17 +376,95 @@ class AirlineRecoveryService:
         score = metrics["canceled"] * 100000 + metrics["missed_connections"] * 5000 + metrics["total_delay_minutes"] * 100 + metrics["affected_passengers"]
         return {"cost_score": score, "lower_is_better": 1}
 
+    def replan_plan(self, plan_id: int, actor: str, role: str, body: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+        """Freeze an overlapping locked plan and spawn a single editable draft from current flight state."""
+        if role not in {"scheduler", "ops_manager"}:
+            raise ApiError(403, "replan_forbidden", "当前角色不能发起方案重排")
+        with self.repo.tx() as conn:
+            plan = conn.execute("SELECT * FROM recovery_plans WHERE id=?", (plan_id,)).fetchone()
+            if not plan:
+                raise ApiError(404, "plan_not_found", "方案不存在")
+
+            # Two dispatchers racing on the same plan share one draft: repeat requests replay it.
+            # This is checked before the status guard so re-submitting against an already-frozen
+            # parent still returns the existing draft instead of erroring.
+            existing = conn.execute("SELECT id FROM recovery_plans WHERE parent_plan_id=? AND status='draft'", (plan_id,)).fetchone()
+            if existing:
+                draft = self.get_plan(existing["id"])
+                draft["deduplicated"] = True
+                return 200, draft
+
+            if plan["status"] == "superseded":
+                raise ApiError(409, "plan_superseded", "历史版本不能再次重排，请基于当前版本操作")
+            if plan["status"] != "locked":
+                raise ApiError(409, "plan_not_locked", "只有已锁定方案可以重排")
+            expected = body.get("expected_revision")
+            if expected is not None and expected != plan["revision"]:
+                raise ApiError(409, "revision_conflict", "方案版本已变化")
+
+            # The replan is only justified when a live disruption overlaps the plan's flights.
+            affected_ids: set[int] = set()
+            for assignment in conn.execute("SELECT a.*, f.origin, f.destination FROM assignments a JOIN flights f ON f.id=a.flight_id WHERE a.plan_id=?", (plan_id,)):
+                if assignment["status"] == "canceled":
+                    continue
+                hits = self._disruption_hits(conn, assignment["aircraft_id"], assignment["crew_id"],
+                                             assignment["origin"], assignment["destination"],
+                                             parse_time(assignment["new_std"]), parse_time(assignment["new_sta"]))
+                if hits:
+                    affected_ids.add(assignment["id"])
+            if not affected_ids:
+                raise ApiError(409, "plan_not_affected", "没有与生效中断在资源或时段上重叠的航班，无需重排")
+
+            name = str(body.get("name", "")).strip() or f"{plan['name']} (重排)"
+            cur = conn.execute(
+                """INSERT INTO recovery_plans(disruption_id,name,status,created_by,created_at,parent_plan_id)
+                   VALUES(?,?,'draft',?,?,?)""",
+                (plan["disruption_id"], name, actor, iso(), plan_id),
+            )
+            draft_id = cur.lastrowid
+            try:
+                # Seed every adjustment from the *current* flight state. Unaffected adjustments inherit
+                # the old plan; affected ones are flagged for mandatory editing and stay non-active.
+                conn.execute(
+                    """INSERT INTO assignments(plan_id,flight_id,aircraft_id,crew_id,new_std,new_sta,status,
+                            delay_minutes,missed_connections,source_assignment_id,affected_by_json)
+                       SELECT ?, a.flight_id, f.aircraft_id, f.crew_id, f.std, f.sta,
+                              CASE WHEN a.status='canceled' THEN 'canceled' ELSE 'planned' END,
+                              CASE WHEN f.delay_minutes THEN f.delay_minutes ELSE 0 END,
+                              a.missed_connections, a.id,
+                              CASE WHEN a.id IN (%s) THEN ? ELSE NULL END
+                       FROM assignments a JOIN flights f ON f.id=a.flight_id WHERE a.plan_id=?"""
+                    % ",".join("?" for _ in affected_ids),
+                    (draft_id, *affected_ids, json.dumps({"reason": "active_disruption"}, ensure_ascii=False), plan_id),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise ApiError(409, "replan_conflict", "生成重排草稿失败") from exc
+
+            # Old results are void: freeze the locked plan as a historical version.
+            conn.execute(
+                "UPDATE recovery_plans SET status='superseded',frozen_at=?,metrics_json=NULL,score_json=NULL WHERE id=?",
+                (iso(), plan_id),
+            )
+            Repository.audit(conn, plan_id, actor, role, "plan_frozen", {"draft_id": draft_id, "affected_assignments": sorted(affected_ids)})
+            Repository.audit(conn, draft_id, actor, role, "plan_replanned", {"parent_plan_id": plan_id, "affected_assignments": sorted(affected_ids)})
+            return 201, self.get_plan(draft_id)
+
     def lock_plan(self, plan_id: int, actor: str, role: str, body: dict[str, Any]) -> dict[str, Any]:
-        if role != "ops_manager": raise ApiError(403, "lock_forbidden", "只有运行经理可以锁定恢复方案")
+        """Publish a draft atomically as one batch. A failed call changes nothing and can be retried."""
+        if role != "ops_manager": raise ApiError(403, "lock_forbidden", "只有运行经理可以发布恢复方案")
         expected = body.get("expected_revision")
         if not isinstance(expected, int): raise ApiError(400, "revision_required", "expected_revision 必须是整数")
         with self.repo.tx() as conn:
             plan = conn.execute("SELECT * FROM recovery_plans WHERE id=?", (plan_id,)).fetchone()
             if not plan: raise ApiError(404, "plan_not_found", "方案不存在")
+            if plan["status"] == "superseded": raise ApiError(409, "plan_superseded", "历史版本不能发布")
             if plan["status"] == "locked": return self.get_plan(plan_id)
             if plan["revision"] != expected: raise ApiError(409, "revision_conflict", "方案版本已变化")
             problems = self._validate_plan(conn, plan_id)
             if problems: raise ApiError(409, "plan_invalid", "方案未通过约束校验", problems)
+            for row in conn.execute("SELECT id FROM assignments WHERE plan_id=? AND affected_by_json IS NOT NULL", (plan_id,)):
+                problems.append({"assignment_id": row["id"], "code": "affected_assignment_unresolved"})
+            if problems: raise ApiError(409, "plan_invalid", "受中断影响的调整尚未处理", problems)
             conflicts = []
             for row in conn.execute("SELECT * FROM assignments WHERE plan_id=? AND status!='canceled'", (plan_id,)).fetchall():
                 conflicting = conn.execute("""SELECT a.*,p.name plan_name FROM assignments a JOIN recovery_plans p ON p.id=a.plan_id
@@ -349,7 +480,7 @@ class AirlineRecoveryService:
                 conn.execute("UPDATE flights SET std=?,sta=?,aircraft_id=?,crew_id=?,delay_minutes=?,revision=revision+1,updated_at=? WHERE id=?",
                              (row["new_std"], row["new_sta"], row["aircraft_id"], row["crew_id"], max(0, row["delay_minutes"]), iso(), row["flight_id"]))
                 conn.execute("UPDATE assignments SET status='active' WHERE id=?", (row["id"],))
-            Repository.audit(conn, plan_id, actor, role, "plan_locked", {"metrics": metrics})
+            Repository.audit(conn, plan_id, actor, role, "plan_locked", {"metrics": metrics, "parent_plan_id": plan["parent_plan_id"]})
             return self.get_plan(plan_id)
 
     def cancel_flight(self, flight_id: int, actor: str, role: str, body: dict[str, Any]) -> dict[str, Any]:
@@ -388,8 +519,12 @@ class AirlineRecoveryService:
         if not plan: raise ApiError(404, "plan_not_found", "方案不存在")
         assignments = [dict(r) for r in conn.execute("""SELECT a.*,f.flight_no,f.origin,f.destination,f.passenger_count FROM assignments a JOIN flights f ON f.id=a.flight_id WHERE a.plan_id=? ORDER BY a.new_std""", (plan_id,))]
         result = dict(plan)
-        result["metrics"] = json.loads(plan["metrics_json"]) if plan["metrics_json"] else self._metrics(conn, plan_id)
-        result["score"] = json.loads(plan["score_json"]) if plan["score_json"] else None
+        if plan["metrics_json"]:
+            result["metrics"] = json.loads(plan["metrics_json"])
+        else:
+            # Stored results are void after a status change; recompute from the current state.
+            result["metrics"] = self._metrics(conn, plan_id)
+        result["score"] = json.loads(plan["score_json"]) if plan["score_json"] else self._score(result["metrics"])
         result["assignments"] = assignments
         return result
 
@@ -397,14 +532,13 @@ class AirlineRecoveryService:
         plans = []
         for row in self.repo.conn.execute("SELECT id FROM recovery_plans WHERE disruption_id=? ORDER BY id", (disruption_id,)):
             plan = self.get_plan(row["id"])
-            if not plan["score"]:
-                problems = self._validate_plan(self.repo.conn, row["id"])
-                plan["valid"] = not problems
-            else:
-                plan["valid"] = True
+            if plan["status"] == "superseded":
+                continue
+            plan["valid"] = not self._validate_plan(self.repo.conn, row["id"])
             plans.append(plan)
-        plans.sort(key=lambda item: item["score"]["cost_score"] if item["score"] else 10**18)
-        return {"disruption_id": disruption_id, "recommended_plan_id": plans[0]["id"] if plans else None, "plans": plans}
+        valid_plans = [p for p in plans if p["valid"]]
+        valid_plans.sort(key=lambda item: (item["score"]["cost_score"], item["id"]))
+        return {"disruption_id": disruption_id, "recommended_plan_id": valid_plans[0]["id"] if valid_plans else None, "plans": plans}
 
     def state(self) -> dict[str, Any]:
         conn = self.repo.conn
@@ -453,7 +587,8 @@ class Handler(BaseHTTPRequestHandler):
             plan_id, action = int(parts[2]), parts[3]
             if action == "assignments": return 200, self.service.add_assignment(plan_id, actor, role, body)
             if action == "validate": return 200, self.service.validate_plan(plan_id, actor, role)
-            if action == "lock": return 200, self.service.lock_plan(plan_id, actor, role, body)
+            if action in ("lock", "publish"): return 200, self.service.lock_plan(plan_id, actor, role, body)
+            if action == "replan": return self.service.replan_plan(plan_id, actor, role, body)
         if len(parts) == 4 and parts[:2] == ["api", "flights"] and parts[2].isdigit():
             flight_id, action = int(parts[2]), parts[3]
             if action == "cancel": return 200, self.service.cancel_flight(flight_id, actor, role, body)
