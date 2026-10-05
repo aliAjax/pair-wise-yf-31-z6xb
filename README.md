@@ -19,6 +19,7 @@ python3 app.py --db airline_recovery.db
 - `POST /api/recovery-plans`：一次提交方案及航班调整。
 - `POST /api/plans/{id}/assignments`：用 `expected_revision` 临时改派。
 - `POST /api/plans/{id}/validate`、`/lock`：校验并原子锁定方案。
+- `POST /api/plans/{id}/replan`：对已锁定方案发起重排。重叠的锁定方案冻结为历史版本（`frozen`），并从当前航班状态生成可编辑草稿，继承原方案未受影响的调整；受影响调整按当前航班状态生成初始值。同一源方案至多一份草稿，重复提交幂等且不再度改写航班。仅 `scheduler`、`ops_manager` 可重排，发布（`/lock`）权限归运行经理。
 - `GET /api/disruptions/{id}/compare`：比较恢复方案成本。
 - `POST /api/flights/{id}/cancel`、`/recover`：取消和人工恢复。
 - `GET /api/state`、`GET /api/plans/{id}`：查询状态和影响。

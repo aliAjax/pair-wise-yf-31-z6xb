@@ -87,7 +87,8 @@ class Repository:
             CREATE TABLE IF NOT EXISTS recovery_plans(
                 id INTEGER PRIMARY KEY AUTOINCREMENT, disruption_id INTEGER NOT NULL REFERENCES disruptions(id), name TEXT NOT NULL,
                 status TEXT NOT NULL DEFAULT 'draft', revision INTEGER NOT NULL DEFAULT 1, score_json TEXT, metrics_json TEXT,
-                created_by TEXT NOT NULL, created_at TEXT NOT NULL, locked_at TEXT, locked_by TEXT
+                created_by TEXT NOT NULL, created_at TEXT NOT NULL, locked_at TEXT, locked_by TEXT,
+                source_plan_id INTEGER REFERENCES recovery_plans(id)
             );
             CREATE TABLE IF NOT EXISTS assignments(
                 id INTEGER PRIMARY KEY AUTOINCREMENT, plan_id INTEGER NOT NULL REFERENCES recovery_plans(id) ON DELETE CASCADE,
@@ -98,6 +99,17 @@ class Repository:
             CREATE TABLE IF NOT EXISTS audit_log(id INTEGER PRIMARY KEY AUTOINCREMENT, plan_id INTEGER, actor TEXT NOT NULL, role TEXT NOT NULL, action TEXT NOT NULL, detail_json TEXT NOT NULL, created_at TEXT NOT NULL);
             """
         )
+        # 兼容旧库：为早期版本的 recovery_plans 补齐重排链所需的 source_plan_id 列
+        for stmt in (
+            "ALTER TABLE recovery_plans ADD COLUMN source_plan_id INTEGER REFERENCES recovery_plans(id)",
+        ):
+            try:
+                self.conn.execute(stmt)
+            except sqlite3.OperationalError:
+                pass
+        # 同一源方案同时至多存在一份可编辑重排草稿，保证并发重排只留一份
+        self.conn.execute("""CREATE UNIQUE INDEX IF NOT EXISTS idx_recovery_plans_one_draft
+                            ON recovery_plans(source_plan_id) WHERE status='draft'""")
 
     @staticmethod
     def audit(conn: sqlite3.Connection, plan_id: int | None, actor: str, role: str, action: str, detail: dict[str, Any]) -> None:
@@ -197,7 +209,9 @@ class AirlineRecoveryService:
         with self.repo.tx() as conn:
             cur = conn.execute("INSERT INTO disruptions(kind,resource_id,starts_at,ends_at,created_at) VALUES(?,?,?,?,?)",
                                (kind, resource.upper() if kind == "airport_closure" else resource, iso(start), iso(end), iso()))
-            return dict(conn.execute("SELECT * FROM disruptions WHERE id=?", (cur.lastrowid,)).fetchone())
+            disruption = dict(conn.execute("SELECT * FROM disruptions WHERE id=?", (cur.lastrowid,)).fetchone())
+            self._invalidate_overlapping_plans(conn, disruption)
+            return disruption
 
     def create_plan(self, actor: str, role: str, body: dict[str, Any]) -> dict[str, Any]:
         if role not in {"scheduler", "ops_manager"}: raise ApiError(403, "plan_forbidden", "当前角色不能创建恢复方案")
@@ -256,9 +270,35 @@ class AirlineRecoveryService:
             if plan["status"] != "draft": raise ApiError(409, "plan_locked", "已锁定方案不能修改")
             if plan["revision"] != expected: raise ApiError(409, "revision_conflict", "方案已被其他人更新")
             self._insert_assignment(conn, plan_id, body, replace=True)
-            conn.execute("UPDATE recovery_plans SET revision=revision+1 WHERE id=?", (plan_id,))
+            conn.execute("UPDATE recovery_plans SET revision=revision+1, metrics_json=NULL, score_json=NULL WHERE id=?", (plan_id,))
             Repository.audit(conn, plan_id, actor, role, "assignment_reassigned", {"flight_id": body.get("flight_id")})
             return self.get_plan(plan_id)
+
+    @staticmethod
+    def _assignment_overlaps_disruption(row: dict[str, Any], disruption: dict[str, Any]) -> bool:
+        """判断航班调整是否与一条中断在资源和时段上同时重叠。"""
+        std, sta = parse_time(row["new_std"]), parse_time(row["new_sta"])
+        d_start, d_end = parse_time(disruption["starts_at"]), parse_time(disruption["ends_at"])
+        if not overlaps(std, sta, d_start, d_end):
+            return False
+        kind, resource = disruption["kind"], disruption["resource_id"]
+        if kind == "aircraft_fault":
+            return row["aircraft_id"] == resource
+        if kind == "crew_timeout":
+            return row["crew_id"] == resource
+        if kind == "airport_closure":
+            return row["origin"] == resource or row["destination"] == resource
+        return False
+
+    def _invalidate_overlapping_plans(self, conn: sqlite3.Connection, disruption: dict[str, Any]) -> None:
+        """新中断登记后，作废所有与其重叠的已锁定方案的缓存结果，迫使重算。"""
+        for plan_row in conn.execute("SELECT id FROM recovery_plans WHERE status='locked'"):
+            for a in conn.execute("""SELECT a.*, f.origin, f.destination FROM assignments a
+                                     JOIN flights f ON f.id=a.flight_id
+                                     WHERE a.plan_id=? AND a.status!='canceled'""", (plan_row["id"],)):
+                if self._assignment_overlaps_disruption(dict(a), disruption):
+                    conn.execute("UPDATE recovery_plans SET metrics_json=NULL, score_json=NULL WHERE id=?", (plan_row["id"],))
+                    break
 
     def _validate_plan(self, conn: sqlite3.Connection, plan_id: int) -> list[dict[str, Any]]:
         plan = conn.execute("SELECT * FROM recovery_plans WHERE id=?", (plan_id,)).fetchone()
@@ -293,6 +333,12 @@ class AirlineRecoveryService:
                 if row["origin"] != row["destination"] and not permit: problems.append({"assignment_id": row["id"], "code": "route_permit_missing"})
                 elif row["origin"] != row["destination"] and not (parse_time(permit["valid_from"]) <= std <= parse_time(permit["valid_to"])):
                     problems.append({"assignment_id": row["id"], "code": "route_permit_window"})
+            for d in conn.execute("SELECT * FROM disruptions WHERE status='active'"):
+                disruption = dict(d)
+                if self._assignment_overlaps_disruption(row, disruption):
+                    problems.append({"assignment_id": row["id"], "code": "disruption_overlap",
+                                     "disruption_id": disruption["id"], "kind": disruption["kind"],
+                                     "resource": disruption["resource_id"]})
             by_aircraft.setdefault(row["aircraft_id"], []).append(row)
             by_crew.setdefault(row["crew_id"], []).append(row)
         for bucket_name, buckets in (("aircraft", by_aircraft), ("crew", by_crew)):
@@ -352,6 +398,57 @@ class AirlineRecoveryService:
             Repository.audit(conn, plan_id, actor, role, "plan_locked", {"metrics": metrics})
             return self.get_plan(plan_id)
 
+    def replan_plan(self, plan_id: int, actor: str, role: str, body: dict[str, Any]) -> dict[str, Any]:
+        """对已锁定方案发起重排：冻结为历史版本，并从当前航班状态生成继承未受影响调整的可编辑草稿。
+
+        并发与幂等：同一源方案至多存在一份草稿（数据库部分唯一索引保证），
+        两个调度员同时重排只会返回同一份草稿，重复提交不会再次改写航班。
+        """
+        if role not in {"scheduler", "ops_manager"}: raise ApiError(403, "replan_forbidden", "当前角色不能重排方案")
+        with self.repo.tx() as conn:
+            plan = conn.execute("SELECT * FROM recovery_plans WHERE id=?", (plan_id,)).fetchone()
+            if not plan: raise ApiError(404, "plan_not_found", "方案不存在")
+            # 幂等：无论源方案是否已冻结，只要已存在重排草稿就直接返回，不重复冻结、不再生成草稿
+            existing = conn.execute("SELECT id FROM recovery_plans WHERE source_plan_id=? AND status='draft' LIMIT 1", (plan_id,)).fetchone()
+            if existing:
+                return self.get_plan(existing["id"])
+            if plan["status"] != "locked": raise ApiError(409, "replan_not_locked", "只有已锁定方案需要重排")
+            rows = [dict(r) for r in conn.execute("""SELECT a.*, f.origin, f.destination FROM assignments a
+                                                      JOIN flights f ON f.id=a.flight_id
+                                                      WHERE a.plan_id=? ORDER BY a.new_std""", (plan_id,))]
+            disruptions = [dict(r) for r in conn.execute("SELECT * FROM disruptions WHERE status='active'")]
+            affected_ids = {
+                a["id"] for a in rows
+                if a["status"] != "canceled" and any(self._assignment_overlaps_disruption(a, d) for d in disruptions)
+            }
+            if not affected_ids:
+                raise ApiError(409, "replan_not_needed", "方案未与新登记中断重叠，无需重排")
+            # 重叠的锁定方案冻结为历史版本，旧结果作废
+            conn.execute("UPDATE recovery_plans SET status='frozen', metrics_json=NULL, score_json=NULL WHERE id=?", (plan_id,))
+            # 从当前航班状态生成可编辑草稿：未受影响的调整继承原方案，
+            # 受影响的调整按当前航班状态生成初始值（原方案写回的状态），供调度员在此基础上重建
+            cur = conn.execute("""INSERT INTO recovery_plans(disruption_id,name,created_by,created_at,source_plan_id,status)
+                                  VALUES(?,?,?,?,?,?)""",
+                               (plan["disruption_id"], f"{plan['name']} 重排草稿", actor, iso(), plan_id, "draft"))
+            new_id = cur.lastrowid
+            for a in rows:
+                if a["id"] in affected_ids:
+                    flight = conn.execute("SELECT * FROM flights WHERE id=?", (a["flight_id"],)).fetchone()
+                    if not flight:
+                        continue
+                    conn.execute("""INSERT INTO assignments(plan_id,flight_id,aircraft_id,crew_id,new_std,new_sta,status,delay_minutes,missed_connections)
+                                    VALUES(?,?,?,?,?,?,?,?,?)""",
+                                 (new_id, flight["id"], flight["aircraft_id"], flight["crew_id"], flight["std"], flight["sta"],
+                                  "planned", flight["delay_minutes"], 0))
+                else:
+                    conn.execute("""INSERT INTO assignments(plan_id,flight_id,aircraft_id,crew_id,new_std,new_sta,status,delay_minutes,missed_connections)
+                                    VALUES(?,?,?,?,?,?,?,?,?)""",
+                                 (new_id, a["flight_id"], a["aircraft_id"], a["crew_id"], a["new_std"], a["new_sta"],
+                                  a["status"], a["delay_minutes"], a["missed_connections"]))
+            Repository.audit(conn, plan_id, actor, role, "plan_replanned",
+                             {"new_plan_id": new_id, "affected_assignment_ids": sorted(affected_ids)})
+            return self.get_plan(new_id)
+
     def cancel_flight(self, flight_id: int, actor: str, role: str, body: dict[str, Any]) -> dict[str, Any]:
         if role not in {"scheduler", "ops_manager"}: raise ApiError(403, "cancel_forbidden", "当前角色不能取消航班")
         reason = str(body.get("reason", "")).strip()
@@ -400,8 +497,10 @@ class AirlineRecoveryService:
             if not plan["score"]:
                 problems = self._validate_plan(self.repo.conn, row["id"])
                 plan["valid"] = not problems
+                plan["problems"] = problems
             else:
                 plan["valid"] = True
+                plan["problems"] = []
             plans.append(plan)
         plans.sort(key=lambda item: item["score"]["cost_score"] if item["score"] else 10**18)
         return {"disruption_id": disruption_id, "recommended_plan_id": plans[0]["id"] if plans else None, "plans": plans}
@@ -454,6 +553,7 @@ class Handler(BaseHTTPRequestHandler):
             if action == "assignments": return 200, self.service.add_assignment(plan_id, actor, role, body)
             if action == "validate": return 200, self.service.validate_plan(plan_id, actor, role)
             if action == "lock": return 200, self.service.lock_plan(plan_id, actor, role, body)
+            if action == "replan": return 201, self.service.replan_plan(plan_id, actor, role, body)
         if len(parts) == 4 and parts[:2] == ["api", "flights"] and parts[2].isdigit():
             flight_id, action = int(parts[2]), parts[3]
             if action == "cancel": return 200, self.service.cancel_flight(flight_id, actor, role, body)
